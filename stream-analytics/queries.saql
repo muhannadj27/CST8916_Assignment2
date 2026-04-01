@@ -1,0 +1,58 @@
+-- AI Assistance Disclosure: These queries were written with the assistance of Claude (Anthropic).
+-- CST8916 Assignment 2 – Azure Stream Analytics Queries
+--
+-- INPUT:  "clickstream-input"  → your Event Hub (clickstream)
+-- OUTPUT: "analytics-output"   → second Event Hub (analytics-output)
+--
+-- Both queries run in the same Stream Analytics job.
+-- TIMESTAMP BY tells ASA to use the event's own timestamp field for windowing
+-- rather than the time the event arrived at the hub.
+
+
+-- =============================================================================
+-- Query 1: Device Type Breakdown
+-- Business question: "Which device types are most active?"
+--
+-- Uses a TUMBLING WINDOW of 1 minute.
+-- Every 60 seconds ASA emits one row per deviceType showing how many
+-- click events came from that device type in that window.
+-- The dashboard uses this to draw a live bar/pie chart.
+-- =============================================================================
+
+SELECT
+    'device_breakdown'          AS query,
+    deviceType,
+    COUNT(*)                    AS event_count,
+    System.Timestamp()          AS window_end
+INTO
+    [analytics-output]
+FROM
+    [clickstream-input] TIMESTAMP BY timestamp
+GROUP BY
+    deviceType,
+    TumblingWindow(minute, 1)
+
+
+-- =============================================================================
+-- Query 2: Traffic Spike Detection
+-- Business question: "Are there traffic spikes?"
+--
+-- Uses a TUMBLING WINDOW of 1 minute.
+-- Counts all events per window. Flags the window as a spike (is_spike = 1)
+-- when the count exceeds the threshold (10 events/minute).
+-- Adjust the threshold to match your expected traffic volume.
+-- The dashboard shows a timeline and highlights spike windows in red.
+-- =============================================================================
+
+SELECT
+    'spike_detection'           AS query,
+    System.Timestamp()          AS window_end,
+    DATEADD(minute, -1, System.Timestamp()) AS window_start,
+    COUNT(*)                    AS event_count,
+    CASE WHEN COUNT(*) > 10 THEN 1 ELSE 0 END AS is_spike
+INTO
+    [analytics-output]
+FROM
+    [clickstream-input] TIMESTAMP BY timestamp
+GROUP BY
+    TumblingWindow(minute, 1)
