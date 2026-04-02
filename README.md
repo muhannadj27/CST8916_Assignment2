@@ -1,491 +1,182 @@
-# Week 10 Lab – Clickstream Analytics with Azure Event Hubs
+# CST8916 – Assignment 2: Real-time Stream Analytics Pipeline
 
-**CST8916 – Remote Data and Real-time Applications**
+> **AI Assistance Disclosure:** This project was developed with the assistance of Claude (Anthropic).
+> All code has been reviewed and understood by the author.
 
----
+## Demo Video
 
-## What You Will Build
-
-A two-page web application deployed on **Azure App Service** that demonstrates real-time clickstream analytics using **Azure Event Hubs**.
-
-### The Two Pages
-
-| Page | URL | What it does |
-|------|-----|-------------|
-| Demo Store | `/` | A fake e-commerce site. Every user action sends an event to Event Hubs. |
-| Live Dashboard | `/dashboard` | Polls `/api/events` every 2 seconds and displays a real-time analytics view. |
+[Watch the demo on YouTube](https://youtu.be/t-ED5jEDGZY)
 
 ---
 
-## Architecture
-
-```mermaid
-flowchart LR
-    subgraph AAS["☁️ Azure App Service"]
-        direction TB
-        Store["🛍️ client.html\nDemo Store\n(Event Producer)"]
-        Dashboard["📊 dashboard.html\nLive Dashboard\n(Event Consumer View)"]
-
-        subgraph Flask["⚙️ app.py — Flask Application"]
-            direction TB
-            Track["/track\nsend_to_event_hubs()"]
-            API["/api/events\n_event_buffer"]
-            Consumer["Background Consumer Thread\nEventHubConsumerClient"]
-        end
-
-        Store -->|"POST /track"| Track
-        API -->|"JSON response"| Dashboard
-        Dashboard -->|"polls every 2 s\nGET /api/events"| API
-    end
-
-    subgraph EH["☁️ Azure Event Hubs"]
-        direction TB
-        NS["Namespace: shopstream"]
-        Hub["Event Hub: clickstream"]
-        P0["Partition 0"]
-        P1["Partition 1"]
-        NS --> Hub
-        Hub --> P0
-        Hub --> P1
-    end
-
-    Track -->|"azure-eventhub SDK\npublish event"| EH
-    EH -->|"read events\ncontinuously"| Consumer
-    Consumer -->|"append to buffer"| API
-
-    %% ── Colour palette ──────────────────────────────────────────────
-    %% Frontend (warm amber)
-    style Store     fill:#FFF3E0,stroke:#E65100,color:#212121,stroke-width:2px
-    style Dashboard fill:#FFF3E0,stroke:#E65100,color:#212121,stroke-width:2px
-
-    %% Flask internals (cool blue)
-    style Flask     fill:#E3F2FD,stroke:#1565C0,color:#212121,stroke-width:2px
-    style Track     fill:#BBDEFB,stroke:#1565C0,color:#212121,stroke-width:1.5px
-    style API       fill:#BBDEFB,stroke:#1565C0,color:#212121,stroke-width:1.5px
-    style Consumer  fill:#BBDEFB,stroke:#1565C0,color:#212121,stroke-width:1.5px
-
-    %% App Service container (light grey)
-    style AAS       fill:#F5F5F5,stroke:#616161,color:#212121,stroke-width:2px
-
-    %% Event Hubs (purple / Microsoft brand)
-    style EH        fill:#F3E5F5,stroke:#6A1B9A,color:#212121,stroke-width:2px
-    style NS        fill:#E1BEE7,stroke:#6A1B9A,color:#212121,stroke-width:1.5px
-    style Hub       fill:#CE93D8,stroke:#6A1B9A,color:#212121,stroke-width:1.5px
-    style P0        fill:#BA68C8,stroke:#6A1B9A,color:#FFFFFF,stroke-width:1.5px
-    style P1        fill:#BA68C8,stroke:#6A1B9A,color:#FFFFFF,stroke-width:1.5px
-```
-
-### Component Summary
-
-| Component | Layer | Role | Technology |
-|-----------|-------|------|------------|
-| `client.html` — Demo Store | Frontend | Generates click events on every user interaction and sends them to the Flask backend | HTML + JavaScript (`fetch`) |
-| `dashboard.html` — Live Dashboard | Frontend | Polls the backend every 2 seconds and renders a real-time event feed and bar chart | HTML + JavaScript (`setInterval`) |
-| `/track` endpoint | Flask — Producer | Receives click events from the store, enriches them with a timestamp, and publishes them to Event Hubs | `EventHubProducerClient` |
-| `/api/events` endpoint | Flask — API | Serves the in-memory event buffer as JSON to the dashboard on each poll | Flask route + `_event_buffer` list |
-| Background Consumer Thread | Flask — Consumer | Continuously reads events from Event Hubs and appends them to the in-memory buffer | `EventHubConsumerClient` |
-| Event Hubs Namespace (`shopstream`) | Azure Cloud | Top-level container that groups one or more Event Hubs under a single connection endpoint | Azure Event Hubs |
-| Event Hub (`clickstream`) | Azure Cloud | The named channel that receives, stores, and delivers the stream of click events | Azure Event Hubs |
-| Partition 0 / Partition 1 | Azure Cloud | Ordered sub-sequences within the Event Hub; events are distributed across partitions to enable parallel consumers and higher throughput | Azure Event Hubs |
-
----
-
-## Why Azure Event Hubs?
-
-The most obvious question when looking at this app is: **why not just write clicks directly to a database or keep them in memory?** Here is why Event Hubs is the right tool for this job.
-
-### The problem without Event Hubs
-
-Imagine the store page POSTs every click directly to a `/track` endpoint that writes to a database or an in-memory list. This works fine for one or two users, but it breaks down quickly:
-
-| Scenario | What goes wrong |
-|----------|----------------|
-| 500 users clicking simultaneously | The database is hammered with 500+ writes/second — latency spikes, connections time out |
-| The dashboard wants to read while writes are happening | Reads and writes compete for the same resource, slowing each other down |
-| You want to add a second consumer (e.g., a fraud-detection service) | You have to change the producer code to fan out to two places — tight coupling |
-| The consumer is temporarily offline | Events that arrived while it was down are lost forever |
-
-### How Event Hubs solves this
-
-Event Hubs acts as a **durable, high-throughput buffer** between producers and consumers:
-
-```mermaid
-flowchart LR
-    A["🖱️ Browser clicks"]
-    B["/track"]
-    C[("☁️ Event Hubs\nthe buffer")]
-    D["⚙️ Consumer thread"]
-    E["📊 Dashboard"]
-
-    A --> B --> C --> D --> E
-
-    style A fill:#FFF3E0,stroke:#E65100,color:#212121
-    style B fill:#BBDEFB,stroke:#1565C0,color:#212121
-    style C fill:#E1BEE7,stroke:#6A1B9A,color:#212121
-    style D fill:#BBDEFB,stroke:#1565C0,color:#212121
-    style E fill:#FFF3E0,stroke:#E65100,color:#212121
-```
-
-- **Decoupling:** The producer (`/track`) only knows about Event Hubs — it does not care who reads the events or how many consumers there are. Add a second consumer (fraud detection, ML pipeline, audit log) without touching the producer.
-- **Durability:** Events are persisted in Event Hubs for up to the configured retention period (1 day in this lab). If the consumer thread crashes and restarts, it picks up where it left off — no events lost.
-- **Throughput:** Event Hubs is designed for millions of events per second. Partitions allow multiple consumers to read in parallel, distributing the load.
-- **Backpressure isolation:** If the dashboard is slow or offline, Event Hubs absorbs the incoming events without slowing down the store page. The producer and consumer run at their own pace.
-
----
-
-## Prerequisites
-
-- Python 3.x and pip installed
-- An **Azure account** (free tier is fine)
-- **Azure CLI** installed — [install guide](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
-- VS Code with the **REST Client** extension (optional)
-
----
-
-## Part 1: Create the Azure Event Hubs Namespace
-
-An **Event Hubs Namespace** is a container that holds one or more Event Hubs (similar to how a database server holds multiple databases).
-
-### Step 1 – Log in to the Azure Portal
-
-Go to [portal.azure.com](https://portal.azure.com) and sign in.
-
-### Step 2 – Create a Resource Group
-
-1. Search for **Resource groups** in the top search bar.
-2. Click **Create**.
-3. Fill in:
-   - **Subscription:** your subscription
-   - **Resource group name:** `cst8916-week10-rg`
-   - **Region:** `Canada Central`
-4. Click **Review + create** → **Create**.
-
-### Step 3 – Create an Event Hubs Namespace
-
-1. Search for **Event Hubs** in the top search bar.
-2. Click **Create**.
-3. Fill in:
-   - **Subscription:** your subscription
-   - **Resource group:** `cst8916-week10-rg`
-   - **Namespace name:** `shopstream-<your-name>` (must be globally unique)
-   - **Region:** `Canada Central`
-   - **Pricing tier:** `Basic`
-4. Click **Review + create** → **Create**.
-5. Wait for deployment to complete, then click **Go to resource**.
-
-### Step 4 – Create an Event Hub inside the Namespace
-
-1. Inside your namespace, click **+ Event Hub** in the top toolbar.
-2. Fill in:
-   - **Name:** `clickstream`
-   - **Partition count:** `2`
-   - **Message retention:** `1` day
-3. Click **Create**.
+## Architecture Diagram
 
 ```
-Event Hubs Namespace: shopstream-<your-name>
-└── Event Hub: clickstream
-    ├── Partition 0  ← some events land here
-    └── Partition 1  ← other events land here
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          Azure App Service                               │
+│                                                                          │
+│   Browser                                                                │
+│   ┌──────────┐  POST /track   ┌──────────────────────────────────────┐  │
+│   │  Demo    │ ─────────────► │           app.py (Flask)             │  │
+│   │  Store   │                │                                      │  │
+│   │client.html│               │  parse_user_agent(User-Agent header) │  │
+│   └──────────┘                │  → adds deviceType, browser, os      │  │
+│                               └─────────────┬────────────────────────┘  │
+│                                             │ send_to_event_hubs()       │
+└─────────────────────────────────────────────┼────────────────────────────┘
+                                              │
+                    ┌─────────────────────────▼──────────────────────────┐
+                    │              Azure Event Hubs Namespace             │
+                    │                                                     │
+                    │   Hub: "clickstream"  (raw enriched events)        │
+                    │   Hub: "analytics-output" (ASA results)            │
+                    └────────────┬──────────────────────┬────────────────┘
+                                 │ input                │ output
+                    ┌────────────▼──────────────────────▼────────────────┐
+                    │           Azure Stream Analytics Job                │
+                    │                                                     │
+                    │  Q1 – Device Breakdown  (TumblingWindow 1 min)     │
+                    │       GROUP BY deviceType → event_count             │
+                    │                                                     │
+                    │  Q2 – Spike Detection   (TumblingWindow 1 min)     │
+                    │       COUNT(*) > 10 threshold → is_spike flag       │
+                    └─────────────────────────────────────────────────────┘
+                                              │
+                    ┌─────────────────────────▼──────────────────────────┐
+                    │                  app.py (Flask)                     │
+                    │                                                     │
+                    │  start_analytics_consumer() reads analytics-output  │
+                    │  stores results in _analytics_buffer (in-memory)   │
+                    │  GET /api/analytics serves buffer as JSON           │
+                    └─────────────────────────┬──────────────────────────┘
+                                              │ poll every 5s
+                    ┌─────────────────────────▼──────────────────────────┐
+                    │           dashboard.html (browser)                  │
+                    │                                                     │
+                    │  • Bar chart: device type breakdown (Chart.js)     │
+                    │  • Spike timeline: per-minute event counts          │
+                    │  • Raw event table with deviceType, browser, os    │
+                    └─────────────────────────────────────────────────────┘
 ```
-
-> **What is a partition?**
-> A partition is an ordered sequence of events within an Event Hub. Events are distributed across partitions to allow multiple consumers to read in parallel. Think of it like two checkout lanes at a store — customers are split between them to keep things moving.
-
-### Step 5 – Copy the Connection String
-
-1. In the namespace, go to **Shared access policies** (left menu).
-2. Click **RootManageSharedAccessKey**.
-3. Copy the **Primary connection string** — you will need it in Part 2.
-
-> **Security note:** A connection string contains a secret key. Never commit it to Git. You will store it as an environment variable.
 
 ---
 
-## Part 2: Run the App Locally
+## Design Decisions
 
-### Step 1 – Clone and install
+### Part 1 – Event Payload Enrichment
+
+**Approach:** Server-side User-Agent parsing in `app.py` using Python's built-in `re` module.
+
+When the browser sends a `POST /track` request, the server reads the `User-Agent` HTTP header and runs regex patterns to extract:
+- `deviceType` — `"desktop"`, `"mobile"`, or `"tablet"`
+- `browser` — `"Chrome"`, `"Firefox"`, `"Safari"`, `"Edge"`, `"Opera"`, or `"Unknown"`
+- `os` — `"Windows"`, `"macOS"`, `"Linux"`, `"Android"`, `"iOS"`, or `"Unknown"`
+
+**Why server-side?** The browser cannot reliably report its own device type. Doing it on the server keeps the client code simple and ensures every event has these fields regardless of which page generated it.
+
+**Why no external library?** A simple regex approach avoids adding a dependency (`ua-parser2` etc.) and is sufficient for the three fields required by the assignment.
+
+### Part 2 – Connecting Stream Analytics to the Dashboard
+
+**Approach:** Stream Analytics → second Event Hub (`analytics-output`) → Flask background thread → in-memory buffer → `/api/analytics` HTTP endpoint → dashboard polls every 5 seconds.
+
+**Why a second Event Hub?** Stream Analytics supports Event Hub as a native output sink with no extra configuration. The alternative (Azure SQL or Blob Storage) would require additional Azure resources, extra SDK dependencies, and more complex polling logic.
+
+**Why poll instead of WebSocket push?** The existing lab dashboard already uses HTTP polling for raw events (`/api/events`). Reusing the same pattern for analytics keeps the architecture consistent and simple to understand and debug.
+
+**Why in-memory buffer?** For a course assignment with a short demo window, an in-memory dictionary is sufficient. In a production system this would be replaced with a database query.
+
+### Stream Analytics Query Design
+
+**Window type:** Tumbling window (non-overlapping, fixed-size). Chosen because:
+- Device breakdown needs a clean "count per minute" with no double-counting
+- Spike detection needs a discrete yes/no per window — overlapping windows would produce noisy results
+
+**Window size:** 1 minute — short enough to see changes quickly during a live demo, large enough to accumulate meaningful counts.
+
+**Spike threshold:** 10 events/minute — chosen to be easily triggerable during a demo by clicking around the store.
+
+---
+
+## Azure Resources Required
+
+| Resource | Purpose |
+|---|---|
+| Azure Event Hubs Namespace | Hosts both event hubs |
+| Event Hub: `clickstream` | Receives enriched click events from the store |
+| Event Hub: `analytics-output` | Receives Stream Analytics query results |
+| Azure Stream Analytics Job | Runs Q1 and Q2 queries |
+| Azure App Service (Linux, Python 3.11) | Hosts the Flask app |
+
+---
+
+## Setup Instructions
+
+### 1. Clone the repository
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/26W_CST8916_Week10-Event-Hubs-Lab.git
-cd 26W_CST8916_Week10-Event-Hubs-Lab
+git clone https://github.com/muhannadj27/CST8916_Assignment2.git
+cd CST8916_Assignment2
+```
+
+### 2. Create Azure Event Hubs
+
+1. In the Azure Portal, create an **Event Hubs Namespace**
+2. Inside it, create two Event Hubs:
+   - `clickstream` (for raw events)
+   - `analytics-output` (for Stream Analytics output)
+3. Go to **Shared access policies → RootManageSharedAccessKey** and copy the connection string
+
+### 3. Create Azure Stream Analytics Job
+
+1. Create a new Stream Analytics Job in Azure Portal
+2. Add input: Event Hub `clickstream` → alias `clickstream-input`
+3. Add output: Event Hub `analytics-output` → alias `analytics-output`
+4. Paste the queries from `stream-analytics/queries.saql` into the query editor
+5. Start the job
+
+### 4. Configure environment variables
+
+```bash
+cp .env.example .env
+# Edit .env and fill in your connection string
+```
+
+For Azure App Service, set these under **Settings → Configuration → Application settings**:
+- `EVENT_HUB_CONNECTION_STR` — your namespace connection string
+- `EVENT_HUB_NAME` — `clickstream`
+- `ANALYTICS_HUB_NAME` — `analytics-output`
+
+### 5. Run locally
+
+```bash
 pip install -r requirements.txt
-```
-
-### Step 2 – Set environment variables
-
-**Linux / macOS:**
-```bash
-export EVENT_HUB_CONNECTION_STR="Endpoint=sb://shopstream-<your-name>.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=<your-key>"
-export EVENT_HUB_NAME="clickstream"
-```
-
-**Windows (PowerShell):**
-```powershell
-$env:EVENT_HUB_CONNECTION_STR="Endpoint=sb://shopstream-<your-name>.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=<your-key>"
-$env:EVENT_HUB_NAME="clickstream"
-```
-
-> Never put your connection string directly in the code. The app reads it from the environment so secrets stay out of source control.
-
-### Step 3 – Run the app
-
-```bash
 python app.py
 ```
 
-You should see:
-```
-Event Hubs consumer thread started
- * Running on http://0.0.0.0:8000
-```
+Visit `http://localhost:8000` for the store and `http://localhost:8000/dashboard` for the dashboard.
 
-### Step 4 – Try it out
+### 6. Deploy to Azure App Service
 
-1. Open `http://localhost:8000` — the ShopStream store loads.
-2. Click on products, add items to cart, click the banner.
-3. Watch the **Event Stream Log** at the bottom of the store page — each click shows as `→ sent to Event Hubs`.
-4. Open `http://localhost:8000/dashboard` — the live dashboard updates every 2 seconds.
+The repo includes a GitHub Actions workflow (`.github/workflows/`) for automatic deployment. Push to `main` to trigger a deploy.
 
----
-
-## Part 3: Understanding the Code
-
-### How an event travels from click to Event Hubs
-
-```mermaid
-flowchart TD
-    S1["1️⃣ User clicks 'Add to Cart'\non the store page"]
-    S2["2️⃣ JavaScript calls\ntrackEvent('add_to_cart', '/products/shoes', 'p_shoe_01')"]
-    S3["3️⃣ fetch() sends POST /track\nwith JSON body:\nevent_type, page, product_id, user_id"]
-    S4["4️⃣ Flask /track route enriches the event\n(adds timestamp)\nand calls send_to_event_hubs()"]
-    S5["5️⃣ EventHubProducerClient\ncreates a batch and sends it\nto Azure Event Hubs"]
-    S6["6️⃣ Event Hubs stores the event\nin one of its partitions"]
-    S7["7️⃣ Background consumer thread\nreads the event via\nEventHubConsumerClient"]
-    S8["8️⃣ _on_event() appends the event\nto the in-memory buffer"]
-    S9["9️⃣ Dashboard polls GET /api/events\nand renders the updated\nevent feed and bar chart"]
-
-    S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7 --> S8 --> S9
-
-    %% ── Colour palette ──────────────────────────────────
-    %% Browser / Frontend (warm amber)
-    style S1 fill:#FFF3E0,stroke:#E65100,color:#212121,stroke-width:2px
-    style S2 fill:#FFF3E0,stroke:#E65100,color:#212121,stroke-width:2px
-    style S3 fill:#FFF3E0,stroke:#E65100,color:#212121,stroke-width:2px
-
-    %% Flask application logic (cool blue)
-    style S4 fill:#BBDEFB,stroke:#1565C0,color:#212121,stroke-width:2px
-    style S5 fill:#BBDEFB,stroke:#1565C0,color:#212121,stroke-width:2px
-
-    %% Azure Event Hubs (purple)
-    style S6 fill:#E1BEE7,stroke:#6A1B9A,color:#212121,stroke-width:2px
-
-    %% Background consumer + buffer (cool blue)
-    style S7 fill:#BBDEFB,stroke:#1565C0,color:#212121,stroke-width:2px
-    style S8 fill:#BBDEFB,stroke:#1565C0,color:#212121,stroke-width:2px
-
-    %% Dashboard / Frontend (warm amber)
-    style S9 fill:#FFF3E0,stroke:#E65100,color:#212121,stroke-width:2px
-```
-
-### Key SDK classes (from `azure-eventhub`)
-
-| Class | Role |
-|-------|------|
-| `EventHubProducerClient` | Sends events to Event Hubs |
-| `EventHubConsumerClient` | Reads events from Event Hubs |
-| `EventData` | Wraps a single event payload (bytes or string) |
-| `create_batch()` | Groups multiple events into one efficient send operation |
-
-### Event payload structure
-
-```json
-{
-  "event_type": "add_to_cart",
-  "page": "/products/shoes",
-  "product_id": "p_shoe_01",
-  "user_id": "u_4a2f",
-  "session_id": "s_9b3e",
-  "timestamp": "2026-03-18T14:22:05.123456+00:00"
-}
-```
-
----
-
-## Part 4: Deploy to Azure App Service
-
-You will deploy the app directly from your GitHub fork using Azure App Service's built-in GitHub integration — no CLI required.
-
-### Step 1 – Fork the repository
-
-1. Go to the lab repository on GitHub.
-2. Click the **Fork** button at the top right.
-3. This creates your own copy at `https://github.com/<your-username>/26W_CST8916_Week10-Event-Hubs-Lab`.
-
-### Step 2 – Clone your fork locally
-
+Alternatively, deploy via Azure CLI:
 ```bash
-git clone https://github.com/<your-username>/26W_CST8916_Week10-Event-Hubs-Lab.git
-cd 26W_CST8916_Week10-Event-Hubs-Lab
-```
-
-You already ran the app locally in Part 2 from this clone. Now you will deploy the same code to Azure directly from this GitHub repository.
-
-### Step 3 – Create the Web App in the portal
-
-1. Go to [portal.azure.com](https://portal.azure.com) and sign in.
-2. In the top search bar, search for **App Services** and click it.
-3. Click **+ Create** → **Web App**.
-4. Fill in the **Basics** tab:
-
-| Field | Value |
-|-------|-------|
-| **Subscription** | your subscription |
-| **Resource group** | `cst8916-week10-rg` (same one from Part 1) |
-| **Name** | `shopstream-<your-name>` (must be globally unique) |
-| **Publish** | Code |
-| **Runtime stack** | Python 3.11 |
-| **Operating System** | Linux |
-| **Region** | Canada Central |
-| **Pricing plan** | Free F1 |
-
-5. Click **Next: Deployment →**.
-
-### Step 4 – Connect your GitHub fork
-
-On the **Deployment** tab:
-
-1. Set **Continuous deployment** to **Enable**.
-2. Under **GitHub Actions settings**, click **Authorize** and sign in to GitHub when prompted.
-3. Fill in:
-   - **Organization:** your GitHub username
-   - **Repository:** `26W_CST8916_Week10-Event-Hubs-Lab`
-   - **Branch:** `main`
-4. Click **Review + create** → **Create**.
-
-> **What just happened?** Azure created a GitHub Actions workflow file in your repository (`.github/workflows/`). Every time you push to `main`, GitHub Actions automatically builds and redeploys the app to Azure. This is called **CI/CD — Continuous Integration / Continuous Deployment**.
-
-### Step 5 – Set Application Settings (environment variables)
-
-The app reads the Event Hubs connection string from environment variables. You set these in the portal so the secret never lives in your code or repository.
-
-1. Go to your App Service → **Environment variables** in the left menu (under **Settings**).
-2. Under the **App settings** tab, click **+ Add** and add each of the following:
-
-| Name | Value |
-|------|-------|
-| `EVENT_HUB_CONNECTION_STR` | your connection string from Part 1, Step 5 |
-| `EVENT_HUB_NAME` | `clickstream` |
-
-3. Click **Apply** → **Confirm**.
-
-> Setting secrets in Application Settings is the Azure equivalent of `export` on your local machine. The app reads them with `os.environ.get()` — the same code works in both environments without any changes.
-
-### Step 6 – Set the startup command
-
-Azure App Service needs to know how to start the Flask app using Gunicorn (the production web server).
-
-1. In your App Service, click **Configuration** → **Stack settings** tab.
-2. In the **Startup command** field, enter:
-   ```
-   gunicorn --bind 0.0.0.0:8000 app:app
-   ```
-3. Click **Apply**.
-
-### Step 7 – Verify the deployment
-
-1. Go to your repository on GitHub → **Actions** tab.
-2. You should see a workflow run in progress or completed. Click it to watch the build logs.
-3. Once the workflow shows a green checkmark, go back to the Azure Portal.
-4. In your App Service, click **Overview** → find the **Default domain** and click it.
-5. The ShopStream store should load. Click around, then open `/dashboard` to see the live analytics.
-
-> If the page does not load immediately, wait 30–60 seconds and refresh. The free tier can take a moment to cold-start.
-
-### Step 8 – Make a change and redeploy
-
-This step demonstrates the power of CI/CD.
-
-1. Open `templates/client.html` in your local clone.
-2. Change the banner text on the `<h2>` tag to something like `Welcome to ShopStream – Live on Azure!`.
-3. Commit and push:
-
-```bash
-git add templates/client.html
-git commit -m "update banner text"
-git push
-```
-
-4. Go to GitHub → **Actions** tab and watch the deployment trigger automatically.
-5. Refresh your live Azure URL — the change appears without any manual steps.
-
----
-
-## Part 5: Observe Events in the Azure Portal
-
-1. Go to your Event Hubs namespace in the Azure Portal.
-2. Click on the `clickstream` Event Hub.
-3. Select **Process data** → **Explore** to see incoming events in real time.
-
-You can also view metrics:
-- Go to the **Overview** tab of the namespace.
-- Look at **Incoming Messages** and **Outgoing Messages** charts.
-
-> These charts show the actual volume of events flowing through your Event Hub — the same data your app is producing.
-
----
-
-## Project Structure
-
-```
-26W_CST8916_Week10-Event-Hubs-Lab/
-├── app.py               # Flask app: /track producer + /api/events consumer endpoint
-├── requirements.txt     # Python dependencies
-├── .gitignore           # Excludes secrets and build artifacts
-├── README.md            # This file
-└── templates/
-    ├── client.html      # Demo e-commerce store (event producer)
-    └── dashboard.html   # Live analytics dashboard (event consumer view)
+az webapp up --name YOUR_APP_NAME --resource-group YOUR_RG --runtime "PYTHON:3.11"
 ```
 
 ---
 
-## Reflection Questions
+## File Structure
 
-Answer these after completing the lab:
-
-1. **Producers and consumers** — In this lab, what is the producer? What is the consumer? How are they decoupled from each other?
-
-   > **Answer:** The **producer** is the Flask `/track` endpoint — it receives click events from the browser and publishes them to Event Hubs using `EventHubProducerClient`. The **consumer** is the background thread running `EventHubConsumerClient`, which reads events from Event Hubs and stores them in the in-memory buffer for the dashboard to display.
-   >
-   > They are decoupled because neither side knows about the other. The producer only talks to Event Hubs — it does not call the consumer directly. The consumer only reads from Event Hubs — it does not know which app produced the events or when. Event Hubs sits in the middle as a buffer, so the producer and consumer can run at different speeds and even go offline independently without breaking each other.
-
-2. **Partitions** — The Event Hub has 2 partitions. If 1,000 events arrive per second, how does having 2 partitions help compared to having 1?
-
-   > **Answer:** With 1 partition, all 1,000 events per second must flow through a single ordered sequence — only one consumer can read from it at a time, creating a bottleneck. With 2 partitions, Event Hubs splits the incoming events across both partitions, and two consumers can read in parallel — effectively doubling throughput. In general, more partitions allow more parallel consumers and higher overall throughput. This is why high-traffic systems use 32 or more partitions.
-
-3. **Connection strings** — Why is it important to store the connection string as an environment variable rather than hardcoding it in `app.py`?
-
-   > **Answer:** A connection string contains a secret key that grants full access to your Event Hubs namespace. If it is hardcoded in `app.py` and the file is pushed to GitHub, anyone who can see the repository — including the public if the repo is public — can use that key to read or write to your Event Hub, rack up costs, or delete data. Storing it as an environment variable keeps the secret out of source control entirely. The code stays safe to share, and the secret is only ever configured in the deployment environment (your terminal or Azure Application Settings).
-
-4. **Event retention** — The Event Hub is configured to retain events for 1 day. What would happen if the consumer app was offline for 2 days and then restarted?
-
-   > **Answer:** Events older than 1 day would be permanently deleted from Event Hubs before the consumer had a chance to read them. When the consumer restarts, it would only see events from the last 1 day — everything before that is gone. This means up to 1 day of click data would be lost. To prevent this, you could increase the retention period (up to 90 days on higher tiers), or use the **Capture** feature to automatically save all events to Azure Blob Storage as a backup before they expire.
-
-5. **Scaling** — If this were a real store with 10,000 simultaneous users, what would you change about the architecture? (Hint: think about the in-memory buffer in `app.py`.)
-
-   > **Answer:** The in-memory buffer (`_event_buffer`) in `app.py` has two major problems at scale. First, it only holds 50 events and resets every time the app restarts or a new instance starts — on App Service with multiple instances, each instance has its own separate buffer, so the dashboard would show incomplete data. Second, memory is lost on restart, meaning no historical data is preserved.
-   >
-   > At 10,000 simultaneous users the architecture should replace the in-memory buffer with a persistent store. A common approach is to feed Event Hubs into **Azure Stream Analytics**, which processes the stream and writes aggregated results to a database (e.g., Azure Cosmos DB or Azure SQL). The dashboard then queries the database instead of an in-memory list. This way, all app instances share the same data, and nothing is lost on restart.
-
----
-
-## Cleanup (Important!)
-
-To avoid charges after the lab, delete the resource group:
-
-```bash
-az group delete --name cst8916-week10-rg --yes --no-wait
 ```
-
-This removes the Event Hubs namespace, the App Service, and all associated resources.
+CST8916_Assignment2/
+├── app.py                        # Flask app (producer + consumer + analytics)
+├── requirements.txt              # Python dependencies
+├── .env.example                  # Environment variable template
+├── templates/
+│   ├── client.html               # Demo store (unchanged from lab)
+│   └── dashboard.html            # Analytics dashboard (upgraded)
+└── stream-analytics/
+    └── queries.saql              # Stream Analytics SAQL queries (Q1 + Q2)
+```
